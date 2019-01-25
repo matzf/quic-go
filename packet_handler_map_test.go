@@ -34,6 +34,19 @@ var _ = Describe("Packet Handler Map", func() {
 		handler = newPacketHandlerMap(conn, 5, utils.DefaultLogger).(*packetHandlerMap)
 	})
 
+	AfterEach(func() {
+		// delete sessions and the server before closing
+		// They might be mock implementations, and we'd have to register the expected calls before otherwise.
+		handler.mutex.Lock()
+		for connID := range handler.handlers {
+			delete(handler.handlers, connID)
+		}
+		handler.server = nil
+		handler.mutex.Unlock()
+		handler.Close()
+		Eventually(handler.listening).Should(BeClosed())
+	})
+
 	It("closes", func() {
 		getMultiplexer() // make the sync.Once execute
 		// replace the clientMuxer. getClientMultiplexer will now return the MockMultiplexer
@@ -83,11 +96,6 @@ var _ = Describe("Packet Handler Map", func() {
 			conn.dataToRead <- getPacket(connID2)
 			Eventually(handledPacket1).Should(BeClosed())
 			Eventually(handledPacket2).Should(BeClosed())
-
-			// makes the listen go routine return
-			packetHandler1.EXPECT().destroy(gomock.Any()).AnyTimes()
-			packetHandler2.EXPECT().destroy(gomock.Any()).AnyTimes()
-			close(conn.dataToRead)
 		})
 
 		It("drops unparseable packets", func() {
@@ -124,6 +132,10 @@ var _ = Describe("Packet Handler Map", func() {
 		It("errors on packets that are smaller than the Payload Length in the packet header", func() {
 			connID := protocol.ConnectionID{1, 2, 3, 4, 5, 6, 7, 8}
 			packetHandler := NewMockPacketHandler(mockCtrl)
+			handled := make(chan struct{})
+			packetHandler.EXPECT().handlePacket(gomock.Any()).Do(func(p *receivedPacket) {
+				close(handled)
+			})
 			packetHandler.EXPECT().GetVersion().Return(versionIETFFrames)
 			packetHandler.EXPECT().GetPerspective().Return(protocol.PerspectiveClient)
 			handler.Add(connID, packetHandler)
@@ -178,6 +190,144 @@ var _ = Describe("Packet Handler Map", func() {
 			handler.Add(protocol.ConnectionID{1, 2, 3, 4, 5, 6, 7, 8}, packetHandler)
 			conn.Close()
 			Eventually(done).Should(BeClosed())
+		})
+
+		Context("coalesced packets", func() {
+			It("errors on packets that are smaller than the length in the packet header, for too small packet number", func() {
+				connID := protocol.ConnectionID{1, 2, 3, 4, 5, 6, 7, 8}
+				data := getPacketWithLength(connID, 3) // gets a packet with a 2 byte packet number
+				_, err := handler.parsePacket(nil, nil, data)
+				Expect(err).To(MatchError("packet length (2 bytes) is smaller than the expected length (3 bytes)"))
+			})
+
+			It("errors on packets that are smaller than the length in the packet header, for too small payload", func() {
+				connID := protocol.ConnectionID{1, 2, 3, 4, 5, 6, 7, 8}
+				data := append(getPacketWithLength(connID, 1000), make([]byte, 500-2 /* for packet number length */)...)
+				_, err := handler.parsePacket(nil, nil, data)
+				Expect(err).To(MatchError("packet length (500 bytes) is smaller than the expected length (1000 bytes)"))
+			})
+
+			It("cuts packets to the right length", func() {
+				connID := protocol.ConnectionID{1, 2, 3, 4, 5, 6, 7, 8}
+				data := append(getPacketWithLength(connID, 456), make([]byte, 1000)...)
+				packetHandler := NewMockPacketHandler(mockCtrl)
+				packetHandler.EXPECT().handlePacket(gomock.Any()).Do(func(p *receivedPacket) {
+					Expect(p.data).To(HaveLen(456 + int(p.hdr.ParsedLen())))
+				})
+				handler.Add(connID, packetHandler)
+				handler.handlePacket(nil, nil, data)
+			})
+
+			It("handles coalesced packets", func() {
+				connID := protocol.ConnectionID{1, 2, 3, 4, 5, 6, 7, 8}
+				packetHandler := NewMockPacketHandler(mockCtrl)
+				handledPackets := make(chan *receivedPacket, 3)
+				packetHandler.EXPECT().handlePacket(gomock.Any()).Do(func(p *receivedPacket) {
+					handledPackets <- p
+				}).Times(3)
+				handler.Add(connID, packetHandler)
+
+				buffer := getPacketBuffer()
+				packet := buffer.Slice[:0]
+				packet = append(packet, append(getPacketWithLength(connID, 10), make([]byte, 10-2 /* packet number len */)...)...)
+				packet = append(packet, append(getPacketWithLength(connID, 20), make([]byte, 20-2 /* packet number len */)...)...)
+				packet = append(packet, append(getPacketWithLength(connID, 30), make([]byte, 30-2 /* packet number len */)...)...)
+				conn.dataToRead <- packet
+
+				now := time.Now()
+				for i := 1; i <= 3; i++ {
+					var p *receivedPacket
+					Eventually(handledPackets).Should(Receive(&p))
+					Expect(p.hdr.DestConnectionID).To(Equal(connID))
+					Expect(p.hdr.Length).To(BeEquivalentTo(10 * i))
+					Expect(p.data).To(HaveLen(int(p.hdr.ParsedLen() + p.hdr.Length)))
+					Expect(p.rcvTime).To(BeTemporally("~", now, scaleDuration(20*time.Millisecond)))
+					Expect(p.buffer.refCount).To(Equal(3))
+				}
+			})
+
+			It("ignores coalesced packet parts if the connection IDs don't match", func() {
+				connID1 := protocol.ConnectionID{1, 2, 3, 4, 5, 6, 7, 8}
+				connID2 := protocol.ConnectionID{8, 7, 6, 5, 4, 3, 2, 1}
+
+				buffer := getPacketBuffer()
+				packet := buffer.Slice[:0]
+				// var packet []byte
+				packet = append(packet, getPacket(connID1)...)
+				packet = append(packet, getPacket(connID2)...)
+
+				packets, err := handler.parsePacket(&net.UDPAddr{}, buffer, packet)
+				Expect(err).To(MatchError("coalesced packet has different destination connection ID: 0x0807060504030201, expected 0x0102030405060708"))
+				Expect(packets).To(HaveLen(1))
+				Expect(packets[0].hdr.DestConnectionID).To(Equal(connID1))
+				Expect(packets[0].buffer.refCount).To(Equal(1))
+			})
+		})
+	})
+
+	Context("stateless reset handling", func() {
+		It("handles packets for connections added with a reset token", func() {
+			packetHandler := NewMockPacketHandler(mockCtrl)
+			connID := protocol.ConnectionID{0xde, 0xca, 0xfb, 0xad}
+			token := [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+			handler.AddWithResetToken(connID, packetHandler, token)
+			// first send a normal packet
+			handledPacket := make(chan struct{})
+			packetHandler.EXPECT().handlePacket(gomock.Any()).Do(func(p *receivedPacket) {
+				Expect(p.hdr.DestConnectionID).To(Equal(connID))
+				close(handledPacket)
+			})
+			conn.dataToRead <- getPacket(connID)
+			Eventually(handledPacket).Should(BeClosed())
+		})
+
+		It("handles stateless resets", func() {
+			packetHandler := NewMockPacketHandler(mockCtrl)
+			connID := protocol.ConnectionID{0xde, 0xca, 0xfb, 0xad}
+			token := [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+			handler.AddWithResetToken(connID, packetHandler, token)
+			packet := append([]byte{0x40} /* short header packet */, make([]byte, 50)...)
+			packet = append(packet, token[:]...)
+			destroyed := make(chan struct{})
+			packetHandler.EXPECT().destroy(errors.New("received a stateless reset")).Do(func(error) {
+				close(destroyed)
+			})
+			conn.dataToRead <- packet
+			Eventually(destroyed).Should(BeClosed())
+		})
+
+		It("detects a stateless that is coalesced with another packet", func() {
+			packetHandler := NewMockPacketHandler(mockCtrl)
+			connID := protocol.ConnectionID{0xde, 0xca, 0xfb, 0xad}
+			token := [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+			handler.AddWithResetToken(connID, packetHandler, token)
+			fakeConnID := protocol.ConnectionID{1, 2, 3, 4, 5}
+			packet := getPacket(fakeConnID)
+			reset := append([]byte{0x40} /* short header packet */, fakeConnID...)
+			reset = append(reset, make([]byte, 50)...) // add some "random" data
+			reset = append(reset, token[:]...)
+			destroyed := make(chan struct{})
+			packetHandler.EXPECT().destroy(errors.New("received a stateless reset")).Do(func(error) {
+				close(destroyed)
+			})
+			conn.dataToRead <- append(packet, reset...)
+			Eventually(destroyed).Should(BeClosed())
+		})
+
+		It("deletes reset tokens when the session is retired", func() {
+			handler.deleteRetiredSessionsAfter = scaleDuration(10 * time.Millisecond)
+			connID := protocol.ConnectionID{0xde, 0xad, 0xbe, 0xef, 0x42}
+			token := [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+			handler.AddWithResetToken(connID, NewMockPacketHandler(mockCtrl), token)
+			handler.Retire(connID)
+			time.Sleep(scaleDuration(30 * time.Millisecond))
+			handler.handlePacket(nil, nil, getPacket(connID))
+			// don't EXPECT any calls to handlePacket of the MockPacketHandler
+			packet := append([]byte{0x40, 0xde, 0xca, 0xfb, 0xad, 0x99} /* short header packet */, make([]byte, 50)...)
+			packet = append(packet, token[:]...)
+			handler.handlePacket(nil, nil, packet)
+			// don't EXPECT any calls to handlePacket of the MockPacketHandler
+			Expect(handler.resetTokens).To(BeEmpty())
 		})
 	})
 

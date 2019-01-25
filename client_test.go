@@ -123,6 +123,7 @@ var _ = Describe("Client", func() {
 		It("resolves the address", func() {
 			manager := NewMockPacketHandlerManager(mockCtrl)
 			manager.EXPECT().Add(gomock.Any(), gomock.Any())
+			manager.EXPECT().Close()
 			mockMultiplexer.EXPECT().AddConn(gomock.Any(), gomock.Any()).Return(manager, nil)
 
 			if os.Getenv("APPVEYOR") == "True" {
@@ -154,6 +155,7 @@ var _ = Describe("Client", func() {
 		It("uses the tls.Config.ServerName as the hostname, if present", func() {
 			manager := NewMockPacketHandlerManager(mockCtrl)
 			manager.EXPECT().Add(gomock.Any(), gomock.Any())
+			manager.EXPECT().Close()
 			mockMultiplexer.EXPECT().AddConn(gomock.Any(), gomock.Any()).Return(manager, nil)
 
 			hostnameChan := make(chan string, 1)
@@ -385,12 +387,9 @@ var _ = Describe("Client", func() {
 			// check that the connection is not closed
 			Expect(conn.Write([]byte("foobar"))).To(Succeed())
 
+			manager.EXPECT().Close()
 			close(run)
 			time.Sleep(50 * time.Millisecond)
-			// check that the connection is closed
-			err := conn.Write([]byte("foobar"))
-			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("use of closed network connection"))
 
 			Eventually(done).Should(BeClosed())
 		})
