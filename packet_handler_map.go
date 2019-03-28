@@ -29,6 +29,7 @@ type packetHandlerMap struct {
 	closed    bool
 
 	deleteClosedSessionsAfter time.Duration
+	deletionTimers            map[string]*time.Timer
 
 	logger utils.Logger
 }
@@ -42,7 +43,8 @@ func newPacketHandlerMap(conn net.PacketConn, connIDLen int, logger utils.Logger
 		listening:                 make(chan struct{}),
 		handlers:                  make(map[string]packetHandler),
 		deleteClosedSessionsAfter: protocol.ClosedSessionDeleteTimeout,
-		logger: logger,
+		deletionTimers:            make(map[string]*time.Timer),
+		logger:                    logger,
 	}
 	go m.listen()
 	return m
@@ -61,13 +63,14 @@ func (h *packetHandlerMap) Remove(id protocol.ConnectionID) {
 func (h *packetHandlerMap) removeByConnectionIDAsString(id string) {
 	h.mutex.Lock()
 	h.handlers[id] = nil
-	h.mutex.Unlock()
-
-	time.AfterFunc(h.deleteClosedSessionsAfter, func() {
+	timer := time.AfterFunc(h.deleteClosedSessionsAfter, func() {
 		h.mutex.Lock()
 		delete(h.handlers, id)
+		delete(h.deletionTimers, id)
 		h.mutex.Unlock()
 	})
+	h.deletionTimers[id] = timer
+	h.mutex.Unlock()
 }
 
 func (h *packetHandlerMap) SetServer(s unknownPacketHandler) {
@@ -111,6 +114,10 @@ func (h *packetHandlerMap) close(e error) error {
 		return nil
 	}
 	h.closed = true
+
+	for _, timer := range h.deletionTimers {
+		timer.Stop()
+	}
 
 	var wg sync.WaitGroup
 	for _, handler := range h.handlers {
