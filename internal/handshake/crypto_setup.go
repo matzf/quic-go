@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"unsafe"
 
 	"github.com/lucas-clemente/quic-go/internal/protocol"
@@ -63,9 +64,6 @@ type cryptoSetup struct {
 
 	messageChan chan []byte
 
-	readEncLevel  protocol.EncryptionLevel
-	writeEncLevel protocol.EncryptionLevel
-
 	paramsChan           <-chan []byte
 	handleParamsCallback func([]byte)
 
@@ -80,18 +78,6 @@ type cryptoSetup struct {
 	clientHelloWritten     bool
 	clientHelloWrittenChan chan struct{}
 
-	initialStream io.Writer
-	initialOpener Opener
-	initialSealer Sealer
-
-	handshakeStream io.Writer
-	handshakeOpener Opener
-	handshakeSealer Sealer
-
-	oneRTTStream io.Writer
-	opener       Opener
-	sealer       Sealer
-
 	receivedWriteKey chan struct{}
 	receivedReadKey  chan struct{}
 	// WriteRecord does a non-blocking send on this channel.
@@ -104,6 +90,23 @@ type cryptoSetup struct {
 	logger utils.Logger
 
 	perspective protocol.Perspective
+
+	mutex sync.Mutex // protects all members below
+
+	readEncLevel  protocol.EncryptionLevel
+	writeEncLevel protocol.EncryptionLevel
+
+	initialStream io.Writer
+	initialOpener Opener
+	initialSealer Sealer
+
+	handshakeStream io.Writer
+	handshakeOpener Opener
+	handshakeSealer Sealer
+
+	oneRTTStream io.Writer
+	opener       Opener
+	sealer       Sealer
 }
 
 var _ qtls.RecordLayer = &cryptoSetup{}
@@ -431,6 +434,7 @@ func (h *cryptoSetup) SetReadKey(suite *qtls.CipherSuite, trafficSecret []byte) 
 		panic(fmt.Sprintf("error creating new AES cipher: %s", err))
 	}
 
+	h.mutex.Lock()
 	switch h.readEncLevel {
 	case protocol.EncryptionInitial:
 		h.readEncLevel = protocol.EncryptionHandshake
@@ -443,6 +447,7 @@ func (h *cryptoSetup) SetReadKey(suite *qtls.CipherSuite, trafficSecret []byte) 
 	default:
 		panic("unexpected read encryption level")
 	}
+	h.mutex.Unlock()
 	h.receivedReadKey <- struct{}{}
 }
 
@@ -455,6 +460,7 @@ func (h *cryptoSetup) SetWriteKey(suite *qtls.CipherSuite, trafficSecret []byte)
 		panic(fmt.Sprintf("error creating new AES cipher: %s", err))
 	}
 
+	h.mutex.Lock()
 	switch h.writeEncLevel {
 	case protocol.EncryptionInitial:
 		h.writeEncLevel = protocol.EncryptionHandshake
@@ -467,6 +473,7 @@ func (h *cryptoSetup) SetWriteKey(suite *qtls.CipherSuite, trafficSecret []byte)
 	default:
 		panic("unexpected write encryption level")
 	}
+	h.mutex.Unlock()
 	h.receivedWriteKey <- struct{}{}
 }
 
@@ -478,6 +485,9 @@ func (h *cryptoSetup) WriteRecord(p []byte) (int, error) {
 		default:
 		}
 	}()
+
+	h.mutex.Lock()
+	defer h.mutex.Unlock()
 
 	switch h.writeEncLevel {
 	case protocol.EncryptionInitial:
@@ -501,54 +511,70 @@ func (h *cryptoSetup) SendAlert(alert uint8) {
 	h.alertChan <- alert
 }
 
-func (h *cryptoSetup) GetSealer() (protocol.EncryptionLevel, Sealer) {
+func (h *cryptoSetup) GetSealer() (encLevel protocol.EncryptionLevel, sealer Sealer) {
+	h.mutex.Lock()
 	if h.sealer != nil {
-		return protocol.Encryption1RTT, h.sealer
+		sealer = h.sealer
+		encLevel = protocol.Encryption1RTT
+	} else if h.handshakeSealer != nil {
+		sealer = h.handshakeSealer
+		encLevel = protocol.EncryptionHandshake
+	} else {
+		sealer = h.initialSealer
+		encLevel = protocol.EncryptionInitial
 	}
-	if h.handshakeSealer != nil {
-		return protocol.EncryptionHandshake, h.handshakeSealer
-	}
-	return protocol.EncryptionInitial, h.initialSealer
+	h.mutex.Unlock()
+	return
 }
 
-func (h *cryptoSetup) GetSealerWithEncryptionLevel(level protocol.EncryptionLevel) (Sealer, error) {
+func (h *cryptoSetup) GetSealerWithEncryptionLevel(level protocol.EncryptionLevel) (sealer Sealer, err error) {
 	errNoSealer := fmt.Errorf("CryptoSetup: no sealer with encryption level %s", level.String())
 
+	h.mutex.Lock()
 	switch level {
 	case protocol.EncryptionInitial:
-		return h.initialSealer, nil
+		sealer = h.initialSealer
 	case protocol.EncryptionHandshake:
-		if h.handshakeSealer == nil {
-			return nil, errNoSealer
+		if h.handshakeSealer != nil {
+			sealer = h.handshakeSealer
+		} else {
+			err = errNoSealer
 		}
-		return h.handshakeSealer, nil
 	case protocol.Encryption1RTT:
-		if h.sealer == nil {
-			return nil, errNoSealer
+		if h.sealer != nil {
+			sealer = h.sealer
+		} else {
+			err = errNoSealer
 		}
-		return h.sealer, nil
 	default:
-		return nil, errNoSealer
+		err = errNoSealer
 	}
+	h.mutex.Unlock()
+	return
 }
 
-func (h *cryptoSetup) GetOpener(level protocol.EncryptionLevel) (Opener, error) {
+func (h *cryptoSetup) GetOpener(level protocol.EncryptionLevel) (opener Opener, err error) {
+	h.mutex.Lock()
 	switch level {
 	case protocol.EncryptionInitial:
-		return h.initialOpener, nil
+		opener = h.initialOpener
 	case protocol.EncryptionHandshake:
-		if h.handshakeOpener == nil {
-			return nil, ErrOpenerNotYetAvailable
+		if h.handshakeOpener != nil {
+			opener = h.handshakeOpener
+		} else {
+			err = ErrOpenerNotYetAvailable
 		}
-		return h.handshakeOpener, nil
 	case protocol.Encryption1RTT:
-		if h.opener == nil {
-			return nil, ErrOpenerNotYetAvailable
+		if h.opener != nil {
+			opener = h.opener
+		} else {
+			err = ErrOpenerNotYetAvailable
 		}
-		return h.opener, nil
 	default:
-		return nil, fmt.Errorf("CryptoSetup: no opener with encryption level %s", level)
+		err = fmt.Errorf("CryptoSetup: no opener with encryption level %s", level)
 	}
+	h.mutex.Unlock()
+	return
 }
 
 func (h *cryptoSetup) ConnectionState() tls.ConnectionState {
